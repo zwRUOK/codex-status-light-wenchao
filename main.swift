@@ -69,25 +69,42 @@ final class NotificationManager {
     
     private var lastNotifiedState: SignalState?
     
-    func notifyStateChange(_ state: SignalState) {
+    func notifyStateChange(_ state: SignalState, activeCount: Int = 0) {
         // 避免重复通知
         guard state != lastNotifiedState else { return }
         lastNotifiedState = state
         
         switch state {
         case .waiting:
+            let body = L10n.text(
+                "Codex 需要你的授权才能继续执行，请点击图标查看并确认。",
+                "Codex needs your approval to continue. Click the icon to view and confirm."
+            )
             sendNotification(
-                title: L10n.text("Codex 需要你授权", "Codex Needs Your Approval"),
-                body: L10n.text("请查看 Codex 请求并确认", "Please check and approve the Codex request"),
+                title: L10n.text("🔔 Codex 等待授权", "🔔 Codex Needs Approval"),
+                body: body,
                 sound: true
             )
+        case .running:
+            if activeCount > 1 {
+                let body = L10n.text(
+                    "Codex 正在处理 \(activeCount) 个任务，请稍候。",
+                    "Codex is processing \(activeCount) tasks. Please wait."
+                )
+                sendNotification(
+                    title: L10n.text("⚙️ Codex 开始工作", "⚙️ Codex Started Working"),
+                    body: body,
+                    sound: false
+                )
+            }
         case .idle:
-            // 可选：任务完成通知（取消注释以启用）
-            // sendNotification(title: "Codex 已完成", body: "所有任务已完成", sound: false)
-            break
-        default:
+            // 空闲状态不发送通知
             break
         }
+    }
+    
+    func resetState() {
+        lastNotifiedState = nil
     }
     
     private func sendNotification(title: String, body: String, sound: Bool) {
@@ -451,7 +468,7 @@ final class CodexStatusMonitor {
         // 发送系统通知（WenChao 新增）
         if snapshot.state != lastSnapshot.state {
             DispatchQueue.main.async {
-                NotificationManager.shared.notifyStateChange(snapshot.state)
+                NotificationManager.shared.notifyStateChange(snapshot.state, activeCount: snapshot.activeCount)
             }
         }
         
@@ -479,7 +496,7 @@ final class CodexStatusMonitor {
 
 // MARK: - Status Item Icon (支持动画)
 private enum StatusItemIcon {
-    static func make(for activeState: SignalState) -> NSImage {
+    static func make(for activeState: SignalState, alpha: CGFloat = 1.0) -> NSImage {
         let image = NSImage(size: NSSize(width: 42, height: 18))
         image.lockFocus()
         defer { image.unlockFocus() }
@@ -497,7 +514,15 @@ private enum StatusItemIcon {
         for (index, state) in states.enumerated() {
             let active = state == activeState
             let rect = NSRect(x: centers[index] - 4, y: 5, width: 8, height: 8)
-            (active ? state.color : state.color.withAlphaComponent(0.20)).setFill()
+            
+            if active {
+                // 活动状态：应用呼吸动画的 alpha 值
+                let animatedColor = state.color.withAlphaComponent(alpha)
+                animatedColor.setFill()
+            } else {
+                // 非活动状态：半透明
+                state.color.withAlphaComponent(0.20).setFill()
+            }
             NSBezierPath(ovalIn: rect).fill()
 
             if active {
@@ -520,8 +545,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var weeklyItem: NSMenuItem?
     private var latestSnapshot = StatusSnapshot(state: .idle, activeCount: 0, weeklyRemainingPercent: nil)
     
-    // 动画相关
-    private var breathingAnimation: CABasicAnimation?
+    // 灯动画相关（只针对灯本身，不影响文字）
+    private var breathingTimer: Timer?
+    private var breathingPhase: CGFloat = 0
     private var currentAnimationState: SignalState = .idle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -536,6 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopBreathingAnimation()
         monitor?.stop()
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
@@ -633,55 +660,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateAnimation(for: snapshot.state)
     }
 
-    // MARK: - 状态灯动画 (WenChao 新增)
+    // MARK: - 状态灯动画 (WenChao 新增 - 只针对灯本身)
     private func updateAnimation(for state: SignalState) {
         guard currentAnimationState != state else { return }
         currentAnimationState = state
         
-        // 获取状态栏按钮的父视图
-        guard let button = statusItem?.button else { return }
-        
-        // 移除旧动画
-        removeAnimation(from: button)
+        // 停止之前的动画
+        stopBreathingAnimation()
         
         // 根据状态添加动画
         switch state {
         case .running:
-            addBreathingAnimation(to: button, duration: 1.5)
+            // 红灯呼吸动画：1.5秒周期
+            startBreathingAnimation(duration: 1.5)
         case .waiting:
-            addPulseAnimation(to: button, duration: 1.0)
+            // 黄灯脉冲动画：1.0秒周期
+            startBreathingAnimation(duration: 1.0)
         case .idle:
-            // 空闲状态不添加动画
-            break
+            // 空闲状态：不添加动画，直接更新图标
+            updateIcon(alpha: 1.0)
         }
     }
     
-    private func addBreathingAnimation(to view: NSView, duration: Double) {
-        let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = 0.6
-        animation.toValue = 1.0
-        animation.duration = duration
-        animation.repeatCount = .infinity
-        animation.autoreverses = true
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        view.layer?.add(animation, forKey: "breathing")
-        breathingAnimation = animation
+    private func startBreathingAnimation(duration: Double) {
+        breathingPhase = 0
+        breathingTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            
+            // 计算呼吸效果的 alpha 值（0.5 到 1.0 之间）
+            self.breathingPhase += CGFloat(0.05 / duration)
+            if self.breathingPhase > 1.0 {
+                self.breathingPhase -= 1.0
+            }
+            
+            // 使用正弦函数实现平滑的呼吸效果
+            let alpha = 0.5 + 0.5 * sin(self.breathingPhase * .pi * 2)
+            
+            // 只更新图标，不影响文字
+            self.updateIcon(alpha: alpha)
+        }
     }
     
-    private func addPulseAnimation(to view: NSView, duration: Double) {
-        let animation = CABasicAnimation(keyPath: "transform.scale")
-        animation.fromValue = 1.0
-        animation.toValue = 1.05
-        animation.duration = duration
-        animation.repeatCount = .infinity
-        animation.autoreverses = true
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        view.layer?.add(animation, forKey: "pulse")
+    private func stopBreathingAnimation() {
+        breathingTimer?.invalidate()
+        breathingTimer = nil
+        breathingPhase = 0
     }
     
-    private func removeAnimation(from view: NSView) {
-        view.layer?.removeAllAnimations()
-        breathingAnimation = nil
+    private func updateIcon(alpha: CGFloat) {
+        guard let button = statusItem?.button else { return }
+        button.image = StatusItemIcon.make(for: latestSnapshot.state, alpha: alpha)
     }
 
     // MARK: - Actions
